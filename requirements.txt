@@ -1,0 +1,10 @@
+gradio==4.20.0
+langchain==0.1.11
+langchain_community==0.0.25
+langchain_openai==0.0.8
+loguru==0.7.2
+numpy==1.26.4
+Pillow==10.2.0
+python-dotenv==1.0.1
+torch==2.2.1
+transformers==4.38.2

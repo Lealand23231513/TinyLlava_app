@@ -1,154 +1,116 @@
+# IMPORTANT: 
+# Before running this demo, you should fill your openai api-key in .env. If you can't find a file named '.env', make a copy
+# of '.env.template' and rename it to '.env' 
 import os
 import numpy as np
-import torch
 from loguru import logger
-# For loading in the tiny-LLaVA-v1-hf model in a transformers pipeline.
 import transformers
-from transformers import pipeline
-from transformers import BitsAndBytesConfig
-
-# For converting input images to PIL images.
+from transformers import  AutoProcessor, LlavaForConditionalGeneration
 from PIL import Image
-
-# For creating the gradio app.
 import gradio as gr
-
-# For creating a simple prompt (open to extension) to our model.
-from langchain.prompts import PromptTemplate
-
-# Our vector database of choice: Chroma!
 from langchain_community.vectorstores import Chroma
 from langchain_openai import OpenAIEmbeddings
-
-# For loading in our OpenAI API key.
-# from google.colab import userdata
-
 from dotenv import load_dotenv
+from PIL import Image
+from uuid import uuid1
+from pathlib import Path
 
 
-# Required for us to load in our pipeline for TinyLLaVA.
 assert transformers.__version__ >= "4.35.3"
-
-model_id = "bczhou/tiny-llava-v1-hf"
-
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_use_double_quant=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.bfloat16
-)
-
-pipe = pipeline(
-    "image-to-text",
-    model=model_id,
-    device_map="auto",
-    use_fast=True,
-    model_kwargs={"quantization_config": bnb_config}
-)
-load_dotenv()
-# Use OpenAI's embeddings for our Chroma collection.
-embeddings = OpenAIEmbeddings(
-    model="text-embedding-ada-002",
-    api_key=os.getenv("OPENAI_API_KEY"),# type: ignore
-)
-collection = Chroma("conversation_memory", embeddings)
-
-# img_data = requests.get("https://imgur.com/Ca6gjuf.png").content
-# with open('sample_image.png', 'wb') as handler:
-#     handler.write(img_data)
-
-max_new_tokens = 200
-
-# Path for storing images.
+MAX_NEW_TOKENS = 200
 IMG_ROOT_PATH = "data/"
-os.makedirs(IMG_ROOT_PATH, exist_ok=True)
 
-# Define the function with (message, history) + additional_inputs -> str.
-def generate_output(message: str, history: list, img: np.ndarray) -> str:
-    """Generates an output given a message and image."""
+def generate_response(image: Image.Image, message: str, **kwargs):
+    global model, processor
+    prompt = f"USER: <image>\n{message}\nASSISTANT:"
+    logger.info(f' ==== prompt ====\n{message}')
+    inputs = processor(prompt, image, return_tensors="pt").to(model.device)
+    outputs = model.generate(**inputs, **kwargs)
+    texts = [processor.decode(output, skip_special_tokens=True) for output in outputs]
+    responses = [{"content": text.split("ASSISTANT:")[-1].strip(), "index": i} for i,text in enumerate(texts)]
+    logger.info(f' ==== responses ====\n{responses}')
+    return responses
 
-    # Get detailed description of the image for Chroma.
-    query = "Please provide a detailed description of the image."
-    img_prompt_template = PromptTemplate.from_template(
-        "USER: <image>\n" +
-        "{query}" +
-        "\n" +
-        "ASSISTANT: "
-    )
-    img_prompt = img_prompt_template.format(query=query)
-    logger.info(f' ==== img_prompt ====\n{img_prompt}')
-    try:
-        outputs = pipe(Image.fromarray(img), prompt=img_prompt, generate_kwargs={"max_new_tokens": max_new_tokens})
-        logger.debug(f' ==== img_outputs ====\n{outputs}')
-        img_desc = outputs[0]["generated_text"].split("ASSISTANT:")[-1]# type: ignore
-        img_desc = img_desc.strip()
-    except Exception as e:
-        logger.error(e)
-        img_desc = ""
-    logger.info(f' ==== img_desc ====\n{img_desc}')
 
-    # Visual Question-Answering!
-    vqa_prompt_template = PromptTemplate.from_template(
-        "Context: {context}\n\n"
-        "USER: <image>\n" +
-        "{message}" +
-        "\n" +
-        "ASSISTANT: "
-    )
-    context = collection.similarity_search(query=message, k=2)
-    context = "\n".join([doc.page_content for doc in context])
-    logger.info(f' ==== find context from vector storage ====\n{context}')
+def generate_output(user_input: str, history: list, img: np.ndarray) -> str:
+    global model, processor
+    img_id = str(uuid1())
+    img_save_pth = Path(f'data/{img_id}.jpeg')
+    img_obj = Image.fromarray(img)
+    img_obj.save(img_save_pth)
+    # generate image description
+    query = "Describe the image in detail."
+    responses = generate_response(img_obj, query, max_new_tokens=MAX_NEW_TOKENS, do_sample=True, temperature=0.7)
+    img_desc = responses[0]['content']
 
-    # Forward pass through the model with given prompt template.
-    vqa_prompt = vqa_prompt_template.format(
-                context=context,
-                message=message
-            )
-    logger.info(f' ==== vqa_prompt ====\n{vqa_prompt}')
-    try:
-        outputs = pipe(
-            Image.fromarray(img),
-            prompt=vqa_prompt,
-            generate_kwargs={"max_new_tokens": max_new_tokens}
-        )
-        logger.debug(f' ==== vqa_outputs ====\n{outputs}')
-        response = outputs[0]["generated_text"].split("ASSISTANT:")[-1]# type: ignore
-        response = response.strip()
-    except Exception as e:
-      logger.error(e)
-      response = ""
-    logger.info(f' ==== vqa_response ====\n{response}')
-    # Add (img_desc, message, response) 3-tuple to Chroma collection.
-    text = f"Image Description: {img_desc}\nUSER: {message}\nASSISTANT: {response}\n"
-    logger.debug(f' ==== add texts to vector storage ====\n{text}')
-    collection.add_texts(texts=[text])
+    # find related image information from collection
+    docs = collection.similarity_search(query=img_desc, k=1)
+    logger.info(f' ==== find context from collection ====\n{docs}')
+    if len(docs)>0:
+        related_img_info_lst = [
+            f"description:\n{doc.page_content}\npath:\n{doc.metadata['path']}"
+            for doc in docs
+        ]
+        related_img_info = "\n".join(related_img_info_lst)
+    else:
+        related_img_info = "No related image found."
+    
+    # add image description to collection
+    collection.add_texts(texts=[img_desc], metadatas=[{'path':str(img_save_pth.absolute())}])
+    logger.debug(f' ==== add texts to vector storage ====\n{img_desc}')
+    
+    # Visual question answer
+    responses = generate_response(img_obj, user_input, max_new_tokens=MAX_NEW_TOKENS, do_sample=True, temperature=0.7)
+    response = responses[0]['content']
 
     # Return model output.
-    return f"**Image description**\n{img_desc}\n**Response**\n{response}"
+    return f"**Related Image Infomation**\n{related_img_info}\n**Response**\n{response}"
 
 
 # Define the ChatInterface, customize, and launch!
-gr.ChatInterface(
-    generate_output,
-    chatbot=gr.Chatbot(
-        label="Chat with me!",
-      ),
-    textbox=gr.Textbox(
-        placeholder="Message ...",
-        scale=7,
-        info="Input your textual response in the text field and your image below!"
-    ),
-    additional_inputs="image",
-    additional_inputs_accordion=gr.Accordion(
-        open=True,
-    ),
-    title="Language-Image Question Answering with bczhou/TinyLLaVA-v1-hf!",
-    description="""
-    This simple gradio app internally uses a Large Language-Vision Model (LLVM) and the Chroma vector database for memory.
-    Note: this minimal app requires both an image and a text-based query before the chatbot system can respond.
-    """,
-    submit_btn="Submit",
-    retry_btn=None,
-    undo_btn="Delete Previous",
-    clear_btn="Clear",
-).launch(debug=True, share=False, server_port = 6006)
+demo = gr.ChatInterface(
+        generate_output,
+        chatbot=gr.Chatbot(
+            label="Chat with me!",
+        ),
+        textbox=gr.Textbox(
+            placeholder="Message ...",
+            scale=7,
+            info="Input your textual response in the text field and your image below!"
+        ),
+        additional_inputs="image",
+        additional_inputs_accordion=gr.Accordion(
+            open=True,
+        ),
+        title="Language-Image Question Answering with bczhou/TinyLLaVA-v1-hf!",
+        description="""
+        This simple gradio app internally uses a Large Language-Vision Model (LLVM) and the Chroma vector database for memory.
+        Note: this minimal app requires both an image and a text-based query before the chatbot system can respond.
+        """,
+        submit_btn="Submit",
+        retry_btn=None,
+        undo_btn="Delete Previous",
+        clear_btn="Clear",
+)
+if __name__ == '__main__':
+    load_dotenv()
+    
+    model_id = "bczhou/tiny-llava-v1-hf"
+    # model_id = "bczhou/TinyLLaVA-3.1B"
+    model = LlavaForConditionalGeneration.from_pretrained(
+        model_id,
+        low_cpu_mem_usage=True,
+        device_map = 'cuda'
+    ).eval()# type:ignore
+    processor = AutoProcessor.from_pretrained(model_id)
+    # Use OpenAI's embeddings for our Chroma collection.
+    embeddings = OpenAIEmbeddings(
+        api_key=os.getenv("OPENAI_API_KEY"),# type: ignore
+    )
+    # This generate a persistant collection. If you want to clear all cached information, delete folder 'chroma' in the same directory.
+    collection = Chroma("conversation_memory", embeddings, persist_directory='chroma')
+    # img_data = requests.get("https://imgur.com/Ca6gjuf.png").content
+    # with open('sample_image.png', 'wb') as handler:
+    #     handler.write(img_data)
+    os.makedirs(IMG_ROOT_PATH, exist_ok=True)
+    demo.queue().launch(server_port=7860)

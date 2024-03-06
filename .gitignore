@@ -1,1 +1,6 @@
 .env
+test*
+chroma
+data
+__pycache__
+.vscode

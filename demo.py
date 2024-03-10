@@ -15,8 +15,6 @@ from PIL import Image
 from uuid import uuid1
 from pathlib import Path
 
-
-assert transformers.__version__ >= "4.35.3"
 MAX_NEW_TOKENS = 200
 IMG_ROOT_PATH = "data/"
 
@@ -74,9 +72,8 @@ demo = gr.ChatInterface(
             label="Chat with me!",
         ),
         textbox=gr.Textbox(
-            placeholder="Message ...",
+
             scale=7,
-            info="Input your textual response in the text field and your image below!"
         ),
         additional_inputs="image",
         additional_inputs_accordion=gr.Accordion(

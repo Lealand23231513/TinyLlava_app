@@ -1,5 +1,5 @@
-gradio==4.20.0
-langchain_community==0.0.25
+gradio==4.21.0
+langchain_community==0.0.27
 langchain_openai==0.0.8
 loguru==0.7.2
 numpy==1.26.4

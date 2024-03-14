@@ -157,47 +157,26 @@ async def list_models():
     return ModelList(data=[model_card])
 
 
-def build_prompt(messages: list[Dict[str,Any]]):
-    prompt = ""
-    image = None
-    for m in messages:
-        if m['role'] == "user":
-            prompt += "USER: "
-            if isinstance(m['content'], str):
-                prompt += m["content"]
-            else:
-                for part in m['content']:
-                    if isinstance(part, str):
-                        prompt += part
-                    else:
-                        prompt += "<image>\n"
-                        image = part
-        elif m['role'] == "assistant":
-            prompt += f"ASSISTANT: {m['content']}"
-        prompt+='ASSISTANT: '
-    return prompt, image
-
-
 def preprocess_messages(
     raw_messages: List[UserMessage | SystemMessage | AssistantMessage],
 ):
     """
     ignore system message
     """
-    messages = []
+    prompt = ""
+    image = None
     num_of_image = 0
     for m in raw_messages:
-        content = None
         match m.role:
             case "user":
+                prompt += "USER: "
                 if isinstance(m.content, str):
-                    content = m.content
+                    prompt+= m.content
                 else:
-                    content = []
                     for part in m.content:
                         match part.type:
                             case "text":
-                                content.append(part.text)
+                                prompt+=part.text
                             case "image_url":
                                 if num_of_image == 1:
                                     raise HTTPException(
@@ -206,19 +185,18 @@ def preprocess_messages(
                                 num_of_image += 1
                                 with urlopen(part.image_url.url) as response:
                                     data = response.read()
-                                    content.append(Image.open(BytesIO(data)))
-                messages.append({"role": m.role, "content": content})
+                                    image=Image.open(BytesIO(data))
+                                prompt+="<image>\n"
             case "assistant":
                 if m.content is None:
                     continue
-                content = m.content
-                messages.append({"role": m.role, "content": content})
-    return messages
+                prompt += f"ASSISTANT: {m.content}"
+    prompt+='ASSISTANT: '
+    return prompt, image
 
 
 def generate_response(model, processor, raw_messages: list, stream=False, **generation_kwargs):
-    messages = preprocess_messages(raw_messages)
-    prompt, image = build_prompt(messages)
+    prompt, image = preprocess_messages(raw_messages)
     if image is None:
         raise HTTPException(status_code=400, detail="No image provided")
     logger.debug(f" ==== prompt ====\n{prompt}")

@@ -23,10 +23,12 @@ from pydantic import BaseModel, Field
 
 from sse_starlette.sse import EventSourceResponse
 from loguru import logger
-from transformers import AutoProcessor, LlavaForConditionalGeneration
+from transformers import AutoProcessor, LlavaForConditionalGeneration, TextIteratorStreamer
+from threading import Thread
 from PIL import Image
 from pathlib import Path
 from uuid import uuid1
+from sse_starlette.sse import EventSourceResponse 
 
 # Set up limit request time
 EventSourceResponse.DEFAULT_PING_INTERVAL = 1000
@@ -98,9 +100,8 @@ class SystemMessage(BaseModel):
 
 
 class DeltaMessage(BaseModel):
-    role: Optional[Literal["user", "assistant", "system"]] = None
+    role: Literal["user", "assistant", "system"]
     content: Optional[str] = None
-    name: Optional[str] = None
 
 
 # for ChatCompletionRequest
@@ -129,9 +130,10 @@ class ChatCompletionResponseChoice(BaseModel):
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):
+    index: int
     delta: DeltaMessage
     finish_reason: Optional[Literal["stop", "length", "tool_calls"]]
-    index: int
+    
 
 
 class ChatCompletionResponse(BaseModel):
@@ -216,22 +218,72 @@ def preprocess_messages(
     return messages
 
 
-def generate_response(model, processor, raw_messages: list, **kwargs):
+def generate_response(model, processor, raw_messages: list, stream=False, **generation_kwargs):
     messages = preprocess_messages(raw_messages)
     prompt, image = build_prompt(messages)
     if image is None:
         raise HTTPException(status_code=400, detail="No image provided")
     logger.debug(f" ==== prompt ====\n{prompt}")
     inputs = processor(prompt, image, return_tensors="pt").to(model.device)
-    raw_responses = model.generate(**inputs, **kwargs)
+    if stream:
+        streamer = TextIteratorStreamer(processor,skip_special_tokens=True)
+        generation_kwargs.update({"streamer":streamer})
+        generation_kwargs.update(inputs)
+        thread = Thread(target=model.generate, kwargs=generation_kwargs, daemon=True)
+        thread.start()
+        return postprocess_stream_responses(streamer)
+    
+    raw_responses = model.generate(**inputs, **generation_kwargs)
     return postprocess_responses(raw_responses)
 
+def postprocess_stream_responses(generator):
+    start_flag=False
+    for chunk_text in generator:
+        chunk_text = cast(str, chunk_text)
+        if 'ASSISTANT:' in chunk_text:
+            continue
+        if start_flag==False and chunk_text.isspace():
+            continue
+        if start_flag==False:
+            start_flag=True
+        chunk_text.replace('\n\n', '\n')
+        delta = DeltaMessage(
+            content=chunk_text,
+            role="assistant",
+        )
+        choice_data = ChatCompletionResponseStreamChoice(
+            index=0,
+            delta=delta,
+            finish_reason=None
+        )
+        chunk = ChatCompletionResponse(
+            model=model_id,
+            id=str(uuid1()),
+            choices=[choice_data],
+            created=int(time.time()),
+            object="chat.completion.chunk"
+        )
+        yield "{}".format(chunk.model_dump_json(exclude_unset=True))
+    choice_data = ChatCompletionResponseStreamChoice(
+        index=0,
+        delta=DeltaMessage(
+            role="assistant"
+        ),
+        finish_reason="stop"
+    )
+    chunk = ChatCompletionResponse(
+        model=model_id,
+        id=str(uuid1()),
+        choices=[choice_data],
+        object="chat.completion.chunk"
+    )
+    yield "{}".format(chunk.model_dump_json(exclude_unset=True))
+    yield '[DONE]'
 
 def postprocess_responses(raw_responses: list[Dict[str, Any]]):
     responses = [
         processor.decode(output, skip_special_tokens=True) for output in raw_responses
     ]
-    logger.debug(f" ==== raw responses ====\n{responses}")
     responses = [response.split("ASSISTANT:")[-1].strip() for response in responses]
     responses = [response.replace('\n\n', '\n') for response in responses]
     logger.debug(f" ==== responses ====\n{responses}")
@@ -245,18 +297,19 @@ async def create_chat_completion(request: ChatCompletionRequest):
 
     if len(request.messages) < 1 or request.messages[-1].role == "assistant":
         raise HTTPException(status_code=400, detail="Invalid request")
-    if request.stream:
-        raise HTTPException(status_code=400, detail="Not support stream")
     if request.tools:
         raise HTTPException(status_code=400, detail="Not support tools")
-    kwargs = dict(
+    generation_kwargs = dict(
         temperature=request.temperature,
         top_p=request.top_p,
         max_new_tokens=request.max_tokens or 200,
         do_sample=True if request.top_p else False
     )
-    logger.debug(f"==== generate kwargs ====\n{kwargs}")
-    responses = generate_response(model, processor, request.messages, **kwargs)
+    logger.debug(f"==== generate kwargs ====\n{generation_kwargs}\nstream={request.stream}")
+    if request.stream:
+        responses_generator = generate_response(model, processor, request.messages, request.stream, **generation_kwargs)
+        return EventSourceResponse(responses_generator, media_type="text/event-stream")
+    responses = generate_response(model, processor, request.messages, **generation_kwargs)
     choices = []
     for i, response in enumerate(responses):
         message = AssistantMessage(role="assistant", content=response)

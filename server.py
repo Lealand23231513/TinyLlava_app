@@ -1,8 +1,6 @@
 """
 This script implements an API for the TinyLLaVA model,
 formatted similarly to OpenAI's API (https://platform.openai.com/docs/api-reference/chat).
-It's designed to be run as a web server using FastAPI and uvicorn,
-making the TinyLLaVA model accessible through OpenAI Client.
 """
 
 import time
